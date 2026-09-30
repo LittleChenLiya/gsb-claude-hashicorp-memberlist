@@ -467,7 +467,9 @@ HANDLE_REMOTE_FAILURE:
 			didContact, err := m.sendPingAndWaitForAck(node.FullAddress(), ping, deadline)
 			if err != nil {
 				var to string
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if cat, ok := ProbeErrorCategoryOf(err); ok && cat == ProbeErrorTimeout {
+					to = fmt.Sprintf("timeout %s: ", probeInterval)
+				} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
 					to = fmt.Sprintf("timeout %s: ", probeInterval)
 				}
 				m.logger.Printf("[ERR] memberlist: Failed fallback TCP ping: %s%s", to, err)
@@ -878,6 +880,21 @@ func (m *Memberlist) setAckHandler(seqNo uint32, ackFn func([]byte, time.Time), 
 		delete(m.ackHandlers, seqNo)
 		m.ackLock.Unlock()
 	})
+}
+
+// stopAckHandlers stops and removes all registered ack/nack handler timers.
+// This is called when the memberlist is shutting down so that probe timers
+// are released on cancellation instead of firing after the memberlist has
+// stopped. It is safe to call multiple times.
+func (m *Memberlist) stopAckHandlers() {
+	m.ackLock.Lock()
+	defer m.ackLock.Unlock()
+	for seqNo, ah := range m.ackHandlers {
+		if ah.timer != nil {
+			ah.timer.Stop()
+		}
+		delete(m.ackHandlers, seqNo)
+	}
 }
 
 // Invokes an ack handler if any is associated, and reaps the handler immediately

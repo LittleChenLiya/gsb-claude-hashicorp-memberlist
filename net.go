@@ -660,10 +660,16 @@ func (m *Memberlist) handleIndirectPing(buf []byte, from net.Addr) {
 	// Setup a timer to fire off a nack if no ack is seen in time.
 	if ind.Nack {
 		go func() {
+			// Release the timer on cancellation (ack received or memberlist
+			// shutdown) so it doesn't fire after we've stopped.
+			timer := time.NewTimer(m.config.ProbeTimeout)
+			defer timer.Stop()
 			select {
 			case <-cancelCh:
 				return
-			case <-time.After(m.config.ProbeTimeout):
+			case <-m.shutdownCh:
+				return
+			case <-timer.C:
 				nack := nackResp{ind.SeqNo}
 				a := Address{
 					Addr: indAddr,
@@ -1386,29 +1392,38 @@ func (m *Memberlist) sendPingAndWaitForAck(a Address, ping ping, deadline time.T
 
 	out, err := encode(pingMsg, &ping, m.config.MsgpackUseNewTimeFormat)
 	if err != nil {
-		return false, err
+		return false, &ProbeError{Category: ProbeErrorDecodeRejected, Err: err}
 	}
 
 	if err = m.rawSendMsgStream(conn, out.Bytes(), m.config.Label); err != nil {
-		return false, err
+		return false, ClassifyProbeError(err)
 	}
 
 	msgType, _, dec, err := m.readStream(conn, m.config.Label)
 	if err != nil {
-		return false, err
+		// readStream can fail on transport errors (peer closed, deadline
+		// exceeded) or on message-level checks (decrypt/decompress/decode).
+		// The latter default to decode-rejected via ClassifyProbeError.
+		return false, ClassifyProbeError(err)
 	}
 
 	if msgType != ackRespMsg {
-		return false, fmt.Errorf("unexpected msgType (%d) from ping %s", msgType, LogConn(conn))
+		return false, &ProbeError{
+			Category: ProbeErrorDecodeRejected,
+			Err:      fmt.Errorf("unexpected msgType (%d) from ping %s", msgType, LogConn(conn)),
+		}
 	}
 
 	var ack ackResp
 	if err = dec.Decode(&ack); err != nil {
-		return false, err
+		return false, &ProbeError{Category: ProbeErrorDecodeRejected, Err: err}
 	}
 
 	if ack.SeqNo != ping.SeqNo {
-		return false, fmt.Errorf("sequence number from ack (%d) doesn't match ping (%d)", ack.SeqNo, ping.SeqNo)
+		return false, &ProbeError{
+			Category: ProbeErrorDecodeRejected,
+			Err:      fmt.Errorf("sequence number from ack (%d) doesn't match ping (%d)", ack.SeqNo, ping.SeqNo),
+		}
 	}
 
 	return true, nil

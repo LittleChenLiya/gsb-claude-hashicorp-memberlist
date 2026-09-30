@@ -749,6 +749,7 @@ func (m *Memberlist) Shutdown() error {
 	m.shutdown.Store(1)
 	close(m.shutdownCh)
 	m.deschedule()
+	m.stopAckHandlers()
 	return nil
 }
 
