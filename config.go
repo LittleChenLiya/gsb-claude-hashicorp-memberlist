@@ -261,6 +261,24 @@ type Config struct {
 	// queue to apply the warning and max depth.
 	QueueCheckInterval time.Duration
 
+	// BroadcastDedupeWindow, when set to a positive duration, enables
+	// coalescing of broadcasts that share the same key (their node name):
+	// a new broadcast replaces an unsent older broadcast with the same key
+	// as long as the older one was enqueued within the window. An older
+	// broadcast that has already been sent, or that was enqueued outside
+	// the window, is left to finish gossiping on its own but is no longer
+	// tracked for deduplication. A zero value (the default) disables
+	// deduplication, preserving the legacy behavior where any new message
+	// invalidates the previous same-key message.
+	BroadcastDedupeWindow time.Duration
+
+	// BroadcastDedupeMaxKeys bounds the number of distinct broadcast keys
+	// tracked for deduplication. When the limit is exceeded, the oldest
+	// tracking entries are released; the broadcasts themselves remain
+	// queued and are still gossiped. A zero value (the default) means
+	// unbounded.
+	BroadcastDedupeMaxKeys int
+
 	// MsgpackUseNewTimeFormat when set to true, force the underlying msgpack
 	// codec to use the new format of time.Time when encoding (used in
 	// go-msgpack v1.1.5 by default). Decoding is not affected, as all

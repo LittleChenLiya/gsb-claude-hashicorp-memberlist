@@ -6,6 +6,7 @@ package memberlist
 import (
 	"math"
 	"sync"
+	"time"
 
 	"github.com/google/btree"
 )
@@ -24,6 +25,24 @@ type TransmitLimitedQueue struct {
 	// number of retransmissions attempted.
 	RetransmitMult int
 
+	// DedupeWindow, when greater than zero, enables coalescing of
+	// broadcasts that share the same key (their name). A new broadcast
+	// replaces an unsent older broadcast with the same key as long as the
+	// older one was enqueued within the window. An older broadcast that
+	// has already been sent, or that was enqueued outside the window, is
+	// left to finish gossiping on its own but is no longer tracked for
+	// deduplication. A zero value (the default) disables deduplication
+	// and preserves the legacy behavior where any new message invalidates
+	// the previous same-key message.
+	DedupeWindow time.Duration
+
+	// DedupeMaxKeys bounds the number of distinct keys tracked for
+	// deduplication. When the limit is exceeded, the oldest tracking
+	// entries are released; the broadcasts themselves remain queued and
+	// are still gossiped, only their dedupe tracking is dropped. A zero
+	// value (the default) means unbounded.
+	DedupeMaxKeys int
+
 	mu    sync.Mutex
 	tq    *btree.BTree // stores *limitedBroadcast as btree.Item
 	tm    map[string]*limitedBroadcast
@@ -37,6 +56,11 @@ type limitedBroadcast struct {
 	b         Broadcast
 
 	name string // set if Broadcast is a NamedBroadcast
+
+	// enqueuedAt records when the item was first submitted to the queue.
+	// It is used to decide whether a same-key broadcast is still within the
+	// deduplication window.
+	enqueuedAt time.Time
 }
 
 // Less tests whether the current item is less than the given argument.
@@ -183,10 +207,11 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 	id := q.idGen
 
 	lb := &limitedBroadcast{
-		transmits: initialTransmits,
-		msgLen:    int64(len(b.Message())),
-		id:        id,
-		b:         b,
+		transmits:  initialTransmits,
+		msgLen:     int64(len(b.Message())),
+		id:         id,
+		b:          b,
+		enqueuedAt: time.Now(),
 	}
 	unique := false
 	if nb, ok := b.(NamedBroadcast); ok {
@@ -197,9 +222,29 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 
 	// Check if this message invalidates another.
 	if lb.name != "" {
-		if old, ok := q.tm[lb.name]; ok {
-			old.b.Finished()
-			q.deleteItem(old)
+		if q.DedupeWindow > 0 {
+			// Dedupe mode: a new broadcast only coalesces with an unsent
+			// older one that was enqueued within the window. Otherwise the
+			// older generation is left to finish gossiping on its own but
+			// is no longer tracked for deduplication.
+			if old, ok := q.tm[lb.name]; ok {
+				if old.transmits == 0 && lb.enqueuedAt.Sub(old.enqueuedAt) <= q.DedupeWindow {
+					old.b.Finished()
+					q.deleteItem(old)
+				} else {
+					// The old generation has either already been sent or
+					// has aged out of the window; stop tracking it for
+					// deduplication without finishing it.
+					delete(q.tm, lb.name)
+				}
+			}
+		} else {
+			// Legacy behavior: any new message invalidates the unsent
+			// previous one with the same name.
+			if old, ok := q.tm[lb.name]; ok {
+				old.b.Finished()
+				q.deleteItem(old)
+			}
 		}
 	} else if !unique {
 		// Slow path, hopefully nothing hot hits this.
@@ -234,15 +279,18 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 // must already hold the mutex.
 func (q *TransmitLimitedQueue) deleteItem(cur *limitedBroadcast) {
 	_ = q.tq.Delete(cur)
-	if cur.name != "" {
+	// Only drop the tracking entry if it still points at this exact item;
+	// a stale generation that was replaced in the dedupe map must not take
+	// the newer generation's entry with it when it finishes.
+	if cur.name != "" && q.tm[cur.name] == cur {
 		delete(q.tm, cur.name)
 	}
-
-	if q.tq.Len() == 0 {
-		// At idle there's no reason to let the id generator keep going
-		// indefinitely.
-		q.idGen = 0
-	}
+	// idGen is intentionally not reset when the queue empties. Resetting
+	// it to zero would reuse the same (transmits, msgLen, id) btree key for
+	// a later item, which can silently replace a live item on insert and
+	// leave a ghost key in the tracking map. The int64 space is large enough
+	// that monotonic growth is safe in practice (see the MaxInt64 wrap
+	// -around guard in queueBroadcast).
 }
 
 // addItem adds the given item into the overall datastructure. You must already
@@ -251,6 +299,34 @@ func (q *TransmitLimitedQueue) addItem(cur *limitedBroadcast) {
 	_ = q.tq.ReplaceOrInsert(cur)
 	if cur.name != "" {
 		q.tm[cur.name] = cur
+	}
+	q.evictDedupeLocked()
+}
+
+// evictDedupeLocked keeps the number of tracked dedupe keys within
+// DedupeMaxKeys by dropping the oldest tracking entries when the limit is
+// exceeded. The broadcasts themselves remain queued and will still be
+// gossiped; only their dedupe tracking is released, so no ghost entries are
+// left behind. Ordering uses the monotonic item id rather than wall-clock
+// time so that eviction is deterministic even when enqueues land in the same
+// timer tick. You must hold the mutex.
+func (q *TransmitLimitedQueue) evictDedupeLocked() {
+	if q.DedupeMaxKeys <= 0 {
+		return
+	}
+	for len(q.tm) > q.DedupeMaxKeys {
+		var oldestName string
+		var oldestID int64
+		for name, cur := range q.tm {
+			if oldestName == "" || cur.id < oldestID {
+				oldestName = name
+				oldestID = cur.id
+			}
+		}
+		if oldestName == "" {
+			break
+		}
+		delete(q.tm, oldestName)
 	}
 }
 
