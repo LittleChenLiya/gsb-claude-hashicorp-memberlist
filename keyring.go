@@ -5,9 +5,77 @@ package memberlist
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sync"
 )
+
+// KeyFingerprint is a non-reversible identifier for an encryption key. It is
+// safe to include in reports and log output because it cannot be used to
+// recover the underlying key bytes.
+type KeyFingerprint string
+
+// fingerprintBytes is the number of bytes of the key digest used to identify
+// a key. 8 bytes (16 hex characters) keeps reports compact while making
+// collisions negligible for any realistic keyring size.
+const fingerprintBytes = 8
+
+// FingerprintKey returns the non-reversible identifier for the given key.
+// The key must be a valid size (16, 24, or 32 bytes).
+func FingerprintKey(key []byte) (KeyFingerprint, error) {
+	if err := ValidateKey(key); err != nil {
+		return "", err
+	}
+	return fingerprintKeyUnsafe(key), nil
+}
+
+// fingerprintKeyUnsafe computes the fingerprint without validating the key.
+// Callers must only pass keys that have already been validated.
+func fingerprintKeyUnsafe(key []byte) KeyFingerprint {
+	sum := sha256.Sum256(key)
+	return KeyFingerprint(hex.EncodeToString(sum[:fingerprintBytes]))
+}
+
+// KeyRotationReport describes the current state of a keyring with respect to
+// key rotation. It lists the fingerprint of the key currently used to encrypt
+// outgoing messages, plus the fingerprints of any backup keys still installed
+// that may receive and decrypt older packets. Reports contain only
+// non-reversible fingerprints; no key bytes are ever exposed.
+type KeyRotationReport struct {
+	// Primary is the fingerprint of the key currently used to encrypt
+	// messages. It is empty when encryption is disabled (no keys installed).
+	Primary KeyFingerprint
+
+	// BackupKeys are the fingerprints of the non-primary keys still installed
+	// on the keyring. Packets encrypted with any of these keys may still be
+	// received and decrypted, so they must remain installed on peers until the
+	// rotation window has elapsed.
+	BackupKeys []KeyFingerprint
+
+	// TotalKeys is the number of keys installed on the keyring.
+	TotalKeys int
+}
+
+// RotationReadiness returns a report describing which key is currently primary
+// and which backup keys are still installed and able to decrypt older packets.
+// The report never exposes key bytes.
+func (k *Keyring) RotationReadiness() KeyRotationReport {
+	k.l.Lock()
+	defer k.l.Unlock()
+
+	report := KeyRotationReport{TotalKeys: len(k.keys)}
+	if len(k.keys) == 0 {
+		return report
+	}
+
+	report.Primary = fingerprintKeyUnsafe(k.keys[0])
+	report.BackupKeys = make([]KeyFingerprint, 0, len(k.keys)-1)
+	for _, key := range k.keys[1:] {
+		report.BackupKeys = append(report.BackupKeys, fingerprintKeyUnsafe(key))
+	}
+	return report
+}
 
 type Keyring struct {
 	// Keys stores the key data used during encryption and decryption. It is
@@ -117,10 +185,15 @@ func (k *Keyring) UseKey(key []byte) error {
 }
 
 // RemoveKey drops a key from the keyring. This will return an error if the key
-// requested for removal is currently at position 0 (primary key).
+// requested for removal is currently at position 0 (primary key), or if the
+// keyring is empty. The last key in use may never be removed.
 func (k *Keyring) RemoveKey(key []byte) error {
 	k.l.Lock()
 	defer k.l.Unlock()
+
+	if len(k.keys) == 0 {
+		return fmt.Errorf("cannot remove key: keyring contains no keys")
+	}
 
 	if bytes.Equal(key, k.keys[0]) {
 		return fmt.Errorf("removing the primary key is not allowed")
