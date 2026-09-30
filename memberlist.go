@@ -218,7 +218,7 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		nodeTimers:           make(map[string]*suspicion),
 		awareness:            newAwareness(conf.AwarenessMaxMultiplier, conf.MetricLabels),
 		ackHandlers:          make(map[uint32]*ackHandler),
-		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},
+		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult, DedupWindow: conf.BroadcastDedupWindow},
 		logger:               logger,
 		metricLabels:         conf.MetricLabels,
 	}

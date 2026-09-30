@@ -13,6 +13,11 @@ a message hits the retransmit limit, it is removed from the queue.
 Additionally, older entries can be invalidated by new messages that
 are contradictory. For example, if we send "{suspect M1 inc: 1},
 then a following {alive M1 inc: 2} will invalidate that message
+
+The underlying TransmitLimitedQueue also supports an optional dedup
+window (see Config.BroadcastDedupWindow): while enabled, a newly
+queued KeyedBroadcast replaces any unsent queued broadcast carrying
+the same key, so only the newest value for a key is ever gossiped.
 */
 
 type memberlistBroadcast struct {

@@ -24,9 +24,19 @@ type TransmitLimitedQueue struct {
 	// number of retransmissions attempted.
 	RetransmitMult int
 
+	// DedupWindow, when greater than zero, enables the optional dedup
+	// window: a newly queued KeyedBroadcast replaces any unsent queued
+	// broadcast carrying the same key. At most DedupWindow distinct keys
+	// are tracked at any time; once the window is full, broadcasts with
+	// previously unseen keys are queued without dedup tracking so that no
+	// stale ("ghost") keys are left behind. A zero or negative value
+	// disables the window entirely.
+	DedupWindow int
+
 	mu    sync.Mutex
 	tq    *btree.BTree // stores *limitedBroadcast as btree.Item
 	tm    map[string]*limitedBroadcast
+	dedup map[string]*limitedBroadcast // optional dedup window, keyed by DedupKey()
 	idGen int64
 }
 
@@ -36,7 +46,8 @@ type limitedBroadcast struct {
 	id        int64 // btree-key[2]: unique incrementing id stamped at submission time
 	b         Broadcast
 
-	name string // set if Broadcast is a NamedBroadcast
+	name     string // set if Broadcast is a NamedBroadcast
+	dedupKey string // set if Broadcast is a KeyedBroadcast tracked by the dedup window
 }
 
 // Less tests whether the current item is less than the given argument.
@@ -149,6 +160,20 @@ type UniqueBroadcast interface {
 	UniqueBroadcast()
 }
 
+// KeyedBroadcast is an optional interface that participates in the queue's
+// optional dedup window (see TransmitLimitedQueue.DedupWindow). When the
+// window is enabled, queueing a broadcast whose DedupKey matches an unsent
+// queued broadcast atomically replaces the older one: the older broadcast's
+// Finished callback is invoked exactly once and only the newest message is
+// ever transmitted.
+type KeyedBroadcast interface {
+	Broadcast
+	// DedupKey returns the identity used by the dedup window to decide
+	// which queued broadcast this message replaces. An empty key opts the
+	// message out of dedup tracking.
+	DedupKey() string
+}
+
 // QueueBroadcast is used to enqueue a broadcast
 func (q *TransmitLimitedQueue) QueueBroadcast(b Broadcast) {
 	q.queueBroadcast(b, 0)
@@ -162,6 +187,9 @@ func (q *TransmitLimitedQueue) lazyInit() {
 	}
 	if q.tm == nil {
 		q.tm = make(map[string]*limitedBroadcast)
+	}
+	if q.dedup == nil {
+		q.dedup = make(map[string]*limitedBroadcast)
 	}
 }
 
@@ -193,6 +221,29 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 		lb.name = nb.Name()
 	} else if _, ok := b.(UniqueBroadcast); ok {
 		unique = true
+	}
+
+	// Optional dedup window: a keyed broadcast replaces the unsent queued
+	// broadcast carrying the same key.
+	if q.DedupWindow > 0 {
+		if kb, ok := b.(KeyedBroadcast); ok {
+			if key := kb.DedupKey(); key != "" {
+				if old, ok := q.dedup[key]; ok {
+					// The replaced broadcast is finished exactly once
+					// here; it is removed from the queue below so no
+					// other path can finish it again.
+					old.b.Finished()
+					q.deleteItem(old)
+					// Replacing a tracked key always reuses the freed
+					// window slot.
+					lb.dedupKey = key
+				} else if len(q.dedup) < q.DedupWindow {
+					lb.dedupKey = key
+				}
+				// Otherwise the window is full: queue the broadcast
+				// without tracking it so no ghost key is left behind.
+			}
+		}
 	}
 
 	// Check if this message invalidates another.
@@ -237,6 +288,13 @@ func (q *TransmitLimitedQueue) deleteItem(cur *limitedBroadcast) {
 	if cur.name != "" {
 		delete(q.tm, cur.name)
 	}
+	if cur.dedupKey != "" {
+		// Only drop the key if it still refers to this item; a newer
+		// replacement may already occupy the slot.
+		if tracked, ok := q.dedup[cur.dedupKey]; ok && tracked == cur {
+			delete(q.dedup, cur.dedupKey)
+		}
+	}
 
 	if q.tq.Len() == 0 {
 		// At idle there's no reason to let the id generator keep going
@@ -251,6 +309,9 @@ func (q *TransmitLimitedQueue) addItem(cur *limitedBroadcast) {
 	_ = q.tq.ReplaceOrInsert(cur)
 	if cur.name != "" {
 		q.tm[cur.name] = cur
+	}
+	if cur.dedupKey != "" {
+		q.dedup[cur.dedupKey] = cur
 	}
 }
 
@@ -389,6 +450,7 @@ func (q *TransmitLimitedQueue) Reset() {
 
 	q.tq = nil
 	q.tm = nil
+	q.dedup = nil
 	q.idGen = 0
 }
 

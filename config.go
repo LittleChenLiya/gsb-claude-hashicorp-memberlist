@@ -78,6 +78,15 @@ type Config struct {
 	// at the expense of increased bandwidth.
 	RetransmitMult int
 
+	// BroadcastDedupWindow, when greater than zero, enables an optional
+	// dedup window on the internal broadcast queue: a newly queued
+	// KeyedBroadcast replaces any unsent queued broadcast carrying the
+	// same DedupKey, so only the newest value for a key is ever gossiped.
+	// At most BroadcastDedupWindow distinct keys are tracked; once the
+	// window is full, broadcasts with unseen keys are queued without
+	// dedup tracking. A zero or negative value disables the window.
+	BroadcastDedupWindow int
+
 	// SuspicionMult is the multiplier for determining the time an
 	// inaccessible node is considered suspect before declaring it dead.
 	// The actual timeout is calculated using the formula:
