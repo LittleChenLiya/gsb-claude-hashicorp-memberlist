@@ -74,3 +74,25 @@ to the protocol on our issue tracker.
 ## Metrics Emission
 
 This library emits metrics using `github.com/hashicorp/go-metrics`.
+
+## Key Rotation
+
+Encryption keys can be rotated without downtime by staging the new key
+alongside the current one, cutting traffic over to it, and then retiring the
+old key:
+
+1. `Keyring.AddKey(newKey)` stages the new key for decryption without
+   changing which key encrypts outgoing messages.
+2. `Keyring.UseKey(newKey)` promotes it to the primary key.
+3. Once all peers have converged, `Keyring.RemoveKey(oldKey)` closes the
+   window in which packets encrypted with the old key are still accepted.
+
+`Keyring.RotationReadiness()` returns a `KeyRotationReadiness` report that
+identifies the current primary key and the backup keys that can still
+decrypt old packets. Keys are referenced only by non-reversible
+SHA-256 fingerprints (`KeyFingerprint`), so the report never contains raw
+key bytes. `Ready` is true once the primary key is the sole installed key.
+
+Removal is refused for the active primary key, for the last key remaining
+on the ring, and for keys that are not installed, so an encrypted keyring
+can never be left without a usable key.

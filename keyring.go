@@ -5,7 +5,10 @@ package memberlist
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -116,22 +119,39 @@ func (k *Keyring) UseKey(key []byte) error {
 	return fmt.Errorf("requested key is not in the keyring")
 }
 
-// RemoveKey drops a key from the keyring. This will return an error if the key
-// requested for removal is currently at position 0 (primary key).
+// RemoveKey drops a key from the keyring.
+//
+// Removal is refused when the key is the currently active primary key at
+// position 0 (promote a replacement with UseKey first), when it would leave
+// the keyring with no key at all, or when the key is not installed on the
+// ring. This guarantees that an encrypted keyring always keeps at least one
+// usable key.
 func (k *Keyring) RemoveKey(key []byte) error {
+	if err := ValidateKey(key); err != nil {
+		return err
+	}
+
 	k.l.Lock()
 	defer k.l.Unlock()
 
+	if len(k.keys) == 0 {
+		return fmt.Errorf("removing a key is not allowed: keyring is empty")
+	}
+	if len(k.keys) == 1 {
+		return fmt.Errorf("removing the last active key is not allowed")
+	}
 	if bytes.Equal(key, k.keys[0]) {
 		return fmt.Errorf("removing the primary key is not allowed")
 	}
+
 	for i, installedKey := range k.keys {
 		if bytes.Equal(key, installedKey) {
 			keys := append(k.keys[:i], k.keys[i+1:]...)
 			k.installKeysLocked(keys, k.keys[0])
+			return nil
 		}
 	}
-	return nil
+	return fmt.Errorf("requested key is not in the keyring")
 }
 
 // installKeysLocked will take out a lock on the keyring, and replace the keys with a
@@ -169,4 +189,81 @@ func (k *Keyring) getPrimaryKeyLocked() (key []byte) {
 		key = k.keys[0]
 	}
 	return
+}
+
+// keyFingerprintLength is the number of SHA-256 bytes rendered in a key
+// fingerprint. The bytes are hex encoded, so each fingerprint is twice this
+// length as a string.
+const keyFingerprintLength = 8
+
+// KeyFingerprint returns a short, non-reversible identifier for an encryption
+// key, suitable for logs and readiness reports. It is computed from the first
+// bytes of the SHA-256 digest of the key material, so it never exposes the
+// raw key bytes and cannot be used to reconstruct the key.
+//
+// This is intended as a correlation handle (for example, comparing the key a
+// peer reports as primary against the local keyring), not as a security
+// boundary.
+func KeyFingerprint(key []byte) string {
+	sum := sha256.Sum256(key)
+	return hex.EncodeToString(sum[:keyFingerprintLength])
+}
+
+// KeyRotationReadiness describes whether the keyring is in a safe state with
+// respect to a key rotation. All key references are fingerprints produced by
+// KeyFingerprint; the report never contains raw key bytes.
+type KeyRotationReadiness struct {
+	// PrimaryKeyID identifies the key at position 0, which is used to
+	// encrypt outgoing messages and is the first key tried for decryption.
+	PrimaryKeyID string
+
+	// LegacyKeyIDs identifies every non-primary key still installed on the
+	// ring. Incoming packets encrypted with any of these keys can still be
+	// decrypted, so they bound the window in which old packets encrypted
+	// before a primary-key cut-over are accepted. Remove them once all peers
+	// have converged on the new primary key.
+	LegacyKeyIDs []string
+
+	// Ready is true only when the primary key is the sole installed key. At
+	// that point no old packets (encrypted with a retired key) can be
+	// decrypted and the rotation is fully converged. It is false while any
+	// legacy key still accepts old packets.
+	Ready bool
+}
+
+// String renders the readiness report as a single human-readable line using
+// only key fingerprints, never raw key bytes.
+func (r *KeyRotationReadiness) String() string {
+	return fmt.Sprintf(
+		"key rotation readiness: primary=%s legacy_keys=[%s] ready=%t",
+		r.PrimaryKeyID,
+		strings.Join(r.LegacyKeyIDs, ","),
+		r.Ready,
+	)
+}
+
+// RotationReadiness returns a KeyRotationReadiness snapshot for the keyring.
+// The snapshot reports the fingerprint of the current primary key and the
+// fingerprints of the backup keys that can still decrypt old packets.
+//
+// It returns an error when the keyring holds no keys, since a keyring without
+// keys cannot serve encrypted traffic and has no primary key to rotate to.
+// The report and its string form never contain raw key bytes.
+func (k *Keyring) RotationReadiness() (*KeyRotationReadiness, error) {
+	k.l.Lock()
+	defer k.l.Unlock()
+
+	if len(k.keys) == 0 {
+		return nil, fmt.Errorf("keyring has no keys installed")
+	}
+
+	report := &KeyRotationReadiness{
+		PrimaryKeyID: KeyFingerprint(k.keys[0]),
+		LegacyKeyIDs: make([]string, 0, len(k.keys)-1),
+		Ready:        len(k.keys) == 1,
+	}
+	for _, key := range k.keys[1:] {
+		report.LegacyKeyIDs = append(report.LegacyKeyIDs, KeyFingerprint(key))
+	}
+	return report, nil
 }
