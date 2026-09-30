@@ -121,7 +121,7 @@ func TestSuspicion_Timer(t *testing.T) {
 		// Create the timer and add the requested confirmations. Wait
 		// the fudge amount to help make sure we calculate the timeout
 		// overall, and don't accumulate extra time.
-		s := newSuspicion(c.from, k, min, max, f)
+		s := newSuspicion(c.from, k, min, max, f, realClock{})
 		fudge := 25 * time.Millisecond
 		for _, p := range c.confirmations {
 			time.Sleep(fudge)
@@ -169,7 +169,7 @@ func TestSuspicion_Timer_ZeroK(t *testing.T) {
 
 	// This should select the min time since there are no expected
 	// confirmations to accelerate the timer.
-	s := newSuspicion("me", 0, 25*time.Millisecond, 30*time.Second, f)
+	s := newSuspicion("me", 0, 25*time.Millisecond, 30*time.Second, f, realClock{})
 	if s.Confirm("foo") {
 		t.Fatalf("should not provide new information")
 	}
@@ -188,7 +188,7 @@ func TestSuspicion_Timer_Immediate(t *testing.T) {
 	}
 
 	// This should underflow the timeout and fire immediately.
-	s := newSuspicion("me", 1, 100*time.Millisecond, 30*time.Second, f)
+	s := newSuspicion("me", 1, 100*time.Millisecond, 30*time.Second, f, realClock{})
 	time.Sleep(200 * time.Millisecond)
 	s.Confirm("foo")
 

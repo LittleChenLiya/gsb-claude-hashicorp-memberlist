@@ -33,8 +33,11 @@ type suspicion struct {
 	// a way the achieves the overall time we'd like.
 	start time.Time
 
+	// clock drives the timer and time calculations.
+	clock clock
+
 	// timer is the underlying timer that implements the timeout.
-	timer *time.Timer
+	timer timer
 
 	// f is the function to call when the timer expires. We hold on to this
 	// because there are cases where we call it directly.
@@ -50,12 +53,13 @@ type suspicion struct {
 // excluded from confirmations since we might get our own suspicion message
 // gossiped back to us. The minimum time will be used if no confirmations are
 // called for (k <= 0).
-func newSuspicion(from string, k int, min time.Duration, max time.Duration, fn func(int)) *suspicion {
+func newSuspicion(from string, k int, min time.Duration, max time.Duration, fn func(int), c clock) *suspicion {
 	s := &suspicion{
 		k:             int32(k),
 		min:           min,
 		max:           max,
 		confirmations: make(map[string]struct{}),
+		clock:         c,
 	}
 
 	// Exclude the from node from any confirmations.
@@ -73,12 +77,12 @@ func newSuspicion(from string, k int, min time.Duration, max time.Duration, fn f
 	if k < 1 {
 		timeout = min
 	}
-	s.timer = time.AfterFunc(timeout, s.timeoutFn)
+	s.timer = c.AfterFunc(timeout, s.timeoutFn)
 
 	// Capture the start time right after starting the timer above so
 	// we should always err on the side of a little longer timeout if
 	// there's any preemption that separates this and the step above.
-	s.start = time.Now()
+	s.start = c.Now()
 	return s
 }
 
@@ -120,7 +124,7 @@ func (s *suspicion) Confirm(from string) bool {
 	// stop the timer then we will call the timeout function directly from
 	// here.
 	n := s.n.Add(1)
-	elapsed := time.Since(s.start)
+	elapsed := s.clock.Now().Sub(s.start)
 	remaining := remainingSuspicionTime(n, s.k, elapsed, s.min, s.max)
 	if s.timer.Stop() {
 		if remaining > 0 {

@@ -1131,8 +1131,16 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		state.Addr = a.Addr
 		state.Port = a.Port
 		if state.State != StateAlive {
+			transitionTime := m.clock.Now()
+			m.stateTransitions.append(StateTransitionEvent{
+				Node:        a.Node,
+				From:        oldState,
+				To:          StateAlive,
+				Incarnation: state.Incarnation,
+				Time:        transitionTime,
+			})
 			state.State = StateAlive
-			state.StateChange = time.Now()
+			state.StateChange = transitionTime
 		}
 	}
 
@@ -1199,8 +1207,16 @@ func (m *Memberlist) suspectNode(s *suspect) {
 
 	// Update the state
 	state.Incarnation = s.Incarnation
+	fromState := state.State
+	changeTime := m.clock.Now()
+	m.stateTransitions.append(StateTransitionEvent{
+		Node:        s.Node,
+		From:        fromState,
+		To:          StateSuspect,
+		Incarnation: s.Incarnation,
+		Time:        changeTime,
+	})
 	state.State = StateSuspect
-	changeTime := time.Now()
 	state.StateChange = changeTime
 
 	// Setup a suspicion timer. Given that we don't have any known phase
@@ -1242,7 +1258,7 @@ func (m *Memberlist) suspectNode(s *suspect) {
 			m.deadNode(d)
 		}
 	}
-	m.nodeTimers[s.Node] = newSuspicion(s.From, k, min, max, fn)
+	m.nodeTimers[s.Node] = newSuspicion(s.From, k, min, max, fn, m.clock)
 }
 
 // deadNode is invoked by the network layer when we get a message
@@ -1293,12 +1309,21 @@ func (m *Memberlist) deadNode(d *dead) {
 
 	// If the dead message was send by the node itself, mark it is left
 	// instead of dead.
+	fromState := state.State
+	toState := StateDead
 	if d.Node == d.From {
-		state.State = StateLeft
-	} else {
-		state.State = StateDead
+		toState = StateLeft
 	}
-	state.StateChange = time.Now()
+	transitionTime := m.clock.Now()
+	m.stateTransitions.append(StateTransitionEvent{
+		Node:        d.Node,
+		From:        fromState,
+		To:          toState,
+		Incarnation: d.Incarnation,
+		Time:        transitionTime,
+	})
+	state.State = toState
+	state.StateChange = transitionTime
 
 	// Notify of death
 	if m.config.Events != nil {

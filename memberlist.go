@@ -70,6 +70,15 @@ type Memberlist struct {
 	nodeTimers map[string]*suspicion // Maps Node.Name -> suspicion timer
 	awareness  *awareness
 
+	// clock drives time-dependent protocol behavior. It defaults to the
+	// real system clock but can be replaced with a mock clock in tests.
+	clock clock
+
+	// stateTransitions is an append-only audit log of member state
+	// transitions observed locally. It is read by callers via
+	// StateTransitionEvents.
+	stateTransitions *stateTransitionLog
+
 	tickerLock sync.Mutex
 	tickers    []*time.Ticker
 	stopTick   chan struct{}
@@ -217,6 +226,8 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		nodeMap:              make(map[string]*nodeState),
 		nodeTimers:           make(map[string]*suspicion),
 		awareness:            newAwareness(conf.AwarenessMaxMultiplier, conf.MetricLabels),
+		clock:                realClock{},
+		stateTransitions:     &stateTransitionLog{},
 		ackHandlers:          make(map[uint32]*ackHandler),
 		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},
 		logger:               logger,
@@ -774,6 +785,20 @@ func (m *Memberlist) getNodeStateChange(addr string) time.Time {
 
 	n := m.nodeMap[addr]
 	return n.StateChange
+}
+
+// StateTransitionEvents returns a snapshot of the read-only audit log of
+// member state transitions (alive -> suspect -> dead/left) observed by this
+// node, in the order they were observed. The returned slice is a copy and
+// will not be modified by memberlist.
+//
+// The audit log records only actual state changes: duplicate gossip messages
+// and messages carrying an old incarnation number do not produce events and
+// never roll back state.
+func (m *Memberlist) StateTransitionEvents() []StateTransitionEvent {
+	m.nodeLock.RLock()
+	defer m.nodeLock.RUnlock()
+	return m.stateTransitions.snapshot()
 }
 
 func (m *Memberlist) changeNode(addr string, f func(*nodeState)) {
