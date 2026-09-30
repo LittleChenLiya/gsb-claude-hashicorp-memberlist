@@ -1131,8 +1131,16 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		state.Addr = a.Addr
 		state.Port = a.Port
 		if state.State != StateAlive {
+			previous := state.State
 			state.State = StateAlive
-			state.StateChange = time.Now()
+			changeTime := m.clock.Now()
+			state.StateChange = changeTime
+			// Record the audit event. A node that was already known and
+			// becomes alive again has recovered from a suspect or dead
+			// judgement; brand new nodes are not audited.
+			if ok {
+				m.recordStateTransition(state, previous, StateAlive, TransitionReasonRecovery, "", changeTime)
+			}
 		}
 	}
 
@@ -1198,10 +1206,17 @@ func (m *Memberlist) suspectNode(s *suspect) {
 	metrics.IncrCounterWithLabels([]string{"memberlist", "msg", "suspect"}, 1, m.metricLabels)
 
 	// Update the state
+	previous := state.State
 	state.Incarnation = s.Incarnation
 	state.State = StateSuspect
-	changeTime := time.Now()
+	changeTime := m.clock.Now()
 	state.StateChange = changeTime
+
+	// Record the local suspect judgement. This is reached at most once per
+	// suspicion cycle: duplicate suspects are either confirmed against the
+	// existing timer above or ignored because the node is no longer alive,
+	// and suspects with an old incarnation are ignored earlier.
+	m.recordStateTransition(state, previous, StateSuspect, TransitionReasonGossip, s.From, changeTime)
 
 	// Setup a suspicion timer. Given that we don't have any known phase
 	// relationship with our peers, we set up k such that we hit the nominal
@@ -1239,15 +1254,23 @@ func (m *Memberlist) suspectNode(s *suspect) {
 			m.logger.Printf("[INFO] memberlist: Marking %s as failed, suspect timeout reached (%d peer confirmations)",
 				state.Name, numConfirmations)
 
-			m.deadNode(d)
+			m.deadNodeWithReason(d, TransitionReasonSuspicionTimeout)
 		}
 	}
-	m.nodeTimers[s.Node] = newSuspicion(s.From, k, min, max, fn)
+	m.nodeTimers[s.Node] = newSuspicionWithClock(m.clock, s.From, k, min, max, fn)
 }
 
 // deadNode is invoked by the network layer when we get a message
 // about a dead node
 func (m *Memberlist) deadNode(d *dead) {
+	m.deadNodeWithReason(d, TransitionReasonGossip)
+}
+
+// deadNodeWithReason applies a dead judgement with an explicit audit reason.
+// TransitionReasonSuspicionTimeout is used when the local suspicion timer
+// (rather than a gossiped dead message) drives the transition; a self-leave
+// is always audited as TransitionReasonLeave.
+func (m *Memberlist) deadNodeWithReason(d *dead, reason StateTransitionReason) {
 	m.nodeLock.Lock()
 	defer m.nodeLock.Unlock()
 	state, ok := m.nodeMap[d.Node]
@@ -1289,16 +1312,24 @@ func (m *Memberlist) deadNode(d *dead) {
 	metrics.IncrCounterWithLabels([]string{"memberlist", "msg", "dead"}, 1, m.metricLabels)
 
 	// Update the state
+	previous := state.State
 	state.Incarnation = d.Incarnation
 
 	// If the dead message was send by the node itself, mark it is left
 	// instead of dead.
+	to := StateDead
 	if d.Node == d.From {
-		state.State = StateLeft
-	} else {
-		state.State = StateDead
+		to = StateLeft
+		reason = TransitionReasonLeave
 	}
-	state.StateChange = time.Now()
+	state.State = to
+	changeTime := m.clock.Now()
+	state.StateChange = changeTime
+
+	// Record the local dead/left judgement. Duplicate dead messages are
+	// ignored by the DeadOrLeft guard above and old incarnation numbers by
+	// the incarnation guard, so this records an effective change once.
+	m.recordStateTransition(state, previous, to, reason, d.From, changeTime)
 
 	// Notify of death
 	if m.config.Events != nil {

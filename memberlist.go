@@ -70,6 +70,17 @@ type Memberlist struct {
 	nodeTimers map[string]*suspicion // Maps Node.Name -> suspicion timer
 	awareness  *awareness
 
+	// clock is used for state transition timestamps and suspicion timers.
+	// It is the wall clock in production and can be replaced with a
+	// controllable clock for tests.
+	clock clock
+
+	// transitionLock guards transitions and transitionSeq. These form the
+	// read-only member state transition audit log.
+	transitionLock sync.Mutex
+	transitions    []StateTransitionEvent
+	transitionSeq  uint64
+
 	tickerLock sync.Mutex
 	tickers    []*time.Ticker
 	stopTick   chan struct{}
@@ -217,6 +228,7 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 		nodeMap:              make(map[string]*nodeState),
 		nodeTimers:           make(map[string]*suspicion),
 		awareness:            newAwareness(conf.AwarenessMaxMultiplier, conf.MetricLabels),
+		clock:                realClock{},
 		ackHandlers:          make(map[uint32]*ackHandler),
 		broadcasts:           &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},
 		logger:               logger,
